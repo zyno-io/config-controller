@@ -1,1 +1,1 @@
-image: ghcr.io/signal24/config-controller:latest
+image: ghcr.io/zyno-io/config-controller:latest

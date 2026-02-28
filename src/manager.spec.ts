@@ -9,7 +9,7 @@ const mockLogger = {
     error: jest.fn()
 };
 
-jest.mock('@signal24/config', () => ({
+jest.mock('@zyno-io/config', () => ({
     parseEnvContent: mockParseEnvContent
 }));
 
@@ -36,12 +36,14 @@ describe('Manager', () => {
         replaceNamespacedSecret: jest.Mock;
         readNamespacedSecret: jest.Mock;
     };
+    let mockAbortController: { abort: jest.Mock };
 
     beforeEach(() => {
         jest.clearAllMocks();
         jest.useFakeTimers();
         mockWatch.mockReset();
-        mockWatch.mockResolvedValue(undefined);
+        mockAbortController = { abort: jest.fn() };
+        mockWatch.mockResolvedValue(mockAbortController);
         mockParseEnvContent.mockReset();
         mockLogger.info.mockReset();
         mockLogger.error.mockReset();
@@ -315,6 +317,33 @@ describe('Manager', () => {
             // Since there's no secret, nothing should be deleted from k8s
             expect(mockCoreV1Api.deleteNamespacedSecret).not.toHaveBeenCalled();
         });
+
+        it('should clear cache when secret deletion fails with 404', async () => {
+            mockCoreV1Api.deleteNamespacedSecret.mockRejectedValue({ code: 404 });
+
+            await startManagerAndWait();
+
+            const orphanSecret = createSecret('gone-secret', 'default', 'missing-config', '1');
+            await triggerSecretEvent('ADDED', orphanSecret);
+
+            await jest.advanceTimersByTimeAsync(0);
+            await Promise.resolve();
+
+            expect(mockCoreV1Api.deleteNamespacedSecret).toHaveBeenCalledWith({
+                name: 'gone-secret',
+                namespace: 'default'
+            });
+            // Should not log an error for 404
+            expect(mockLogger.error).not.toHaveBeenCalled();
+
+            // Trigger another sync - the cache entry should be gone so no more delete attempts
+            mockCoreV1Api.deleteNamespacedSecret.mockClear();
+            manager.syncSecrets();
+            await jest.advanceTimersByTimeAsync(0);
+            await Promise.resolve();
+
+            expect(mockCoreV1Api.deleteNamespacedSecret).not.toHaveBeenCalled();
+        });
     });
 
     describe('createSecretForConfigMap', () => {
@@ -512,6 +541,149 @@ describe('Manager', () => {
 
             // Should have retried the watch
             expect(mockWatch).toHaveBeenCalledTimes(3); // 2 initial + 1 retry
+        });
+    });
+
+    describe('graceful shutdown', () => {
+        it('should clear the sync interval and abort watch connections', async () => {
+            const startPromise = manager.start();
+            await jest.advanceTimersByTimeAsync(5000);
+            await startPromise;
+
+            // Collect the abort controllers returned from both watch calls
+            const configMapAbort = await mockWatch.mock.results[0].value;
+            const secretAbort = await mockWatch.mock.results[1].value;
+
+            manager.stop();
+
+            expect(configMapAbort.abort).toHaveBeenCalled();
+            expect(secretAbort.abort).toHaveBeenCalled();
+        });
+
+        it('should not retry watches after stop is called', async () => {
+            const startPromise = manager.start();
+            await jest.advanceTimersByTimeAsync(5000);
+            await startPromise;
+
+            const configMapErrorCb = mockWatch.mock.calls.find(call => call[0] === '/api/v1/configmaps')?.[3];
+            const secretErrorCb = mockWatch.mock.calls.find(call => call[0] === '/api/v1/secrets')?.[3];
+
+            manager.stop();
+
+            // Trigger errors after stop
+            configMapErrorCb(new Error('Watch closed'));
+            secretErrorCb(new Error('Watch closed'));
+
+            // Advance past any potential retry delay
+            await jest.advanceTimersByTimeAsync(60_000);
+
+            // Should still only have the 2 initial watch calls - no retries
+            expect(mockWatch).toHaveBeenCalledTimes(2);
+        });
+    });
+
+    describe('exponential backoff', () => {
+        it('should use exponential backoff for consecutive watch failures', async () => {
+            const startPromise = manager.start();
+            await jest.advanceTimersByTimeAsync(5000);
+            await startPromise;
+
+            // Initial call count
+            expect(mockWatch).toHaveBeenCalledTimes(2);
+
+            // First failure - should retry after 1s (initial delay)
+            const errorCallback1 = mockWatch.mock.calls.find(call => call[0] === '/api/v1/configmaps')?.[3];
+            errorCallback1(new Error('fail'));
+
+            await jest.advanceTimersByTimeAsync(1000);
+            expect(mockWatch).toHaveBeenCalledTimes(3);
+
+            // Second failure - should retry after 2s
+            const errorCallback2 = mockWatch.mock.calls[2][3];
+            errorCallback2(new Error('fail'));
+
+            // Not yet at 2s
+            await jest.advanceTimersByTimeAsync(1000);
+            expect(mockWatch).toHaveBeenCalledTimes(3);
+
+            // Now at 2s
+            await jest.advanceTimersByTimeAsync(1000);
+            expect(mockWatch).toHaveBeenCalledTimes(4);
+
+            // Third failure - should retry after 4s
+            const errorCallback3 = mockWatch.mock.calls[3][3];
+            errorCallback3(new Error('fail'));
+
+            await jest.advanceTimersByTimeAsync(3999);
+            expect(mockWatch).toHaveBeenCalledTimes(4);
+
+            await jest.advanceTimersByTimeAsync(1);
+            expect(mockWatch).toHaveBeenCalledTimes(5);
+        });
+    });
+
+    describe('resourceVersion tracking', () => {
+        it('should pass resourceVersion when resuming watch', async () => {
+            const startPromise = manager.start();
+            await jest.advanceTimersByTimeAsync(5000);
+            await startPromise;
+
+            // Simulate a configmap event with a resourceVersion
+            const eventCallback = mockWatch.mock.calls.find(call => call[0] === '/api/v1/configmaps')?.[2];
+            eventCallback('ADDED', {
+                metadata: {
+                    name: 'cm1',
+                    namespace: 'default',
+                    resourceVersion: '500',
+                    labels: { 'config.s24.dev/target-secret': 'sec1' }
+                },
+                data: {}
+            });
+
+            // Now trigger a watch error to cause reconnect
+            const errorCallback = mockWatch.mock.calls.find(call => call[0] === '/api/v1/configmaps')?.[3];
+            errorCallback(new Error('connection lost'));
+
+            await jest.advanceTimersByTimeAsync(1000);
+
+            // The reconnect should include resourceVersion
+            const reconnectCall = mockWatch.mock.calls[2]; // 3rd call (index 2)
+            expect(reconnectCall[0]).toBe('/api/v1/configmaps');
+            expect(reconnectCall[1]).toEqual({
+                labelSelector: 'config.s24.dev/target-secret',
+                resourceVersion: '500'
+            });
+        });
+
+        it('should reset resourceVersion on 410 Gone error', async () => {
+            const startPromise = manager.start();
+            await jest.advanceTimersByTimeAsync(5000);
+            await startPromise;
+
+            // Simulate a configmap event to set resourceVersion
+            const eventCallback = mockWatch.mock.calls.find(call => call[0] === '/api/v1/configmaps')?.[2];
+            eventCallback('ADDED', {
+                metadata: {
+                    name: 'cm1',
+                    namespace: 'default',
+                    resourceVersion: '500',
+                    labels: { 'config.s24.dev/target-secret': 'sec1' }
+                },
+                data: {}
+            });
+
+            // Trigger a 410 Gone error
+            const errorCallback = mockWatch.mock.calls.find(call => call[0] === '/api/v1/configmaps')?.[3];
+            errorCallback({ code: 410, message: 'Gone' });
+
+            await jest.advanceTimersByTimeAsync(1000);
+
+            // The reconnect should NOT include resourceVersion (it was reset)
+            const reconnectCall = mockWatch.mock.calls[2];
+            expect(reconnectCall[0]).toBe('/api/v1/configmaps');
+            expect(reconnectCall[1]).toEqual({
+                labelSelector: 'config.s24.dev/target-secret'
+            });
         });
     });
 

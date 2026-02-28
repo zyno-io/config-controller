@@ -4,6 +4,10 @@ import { Manager } from './manager';
 async function run() {
     const k8sClient = new K8sClient();
     const manager = new Manager(k8sClient);
+
+    process.on('SIGTERM', () => manager.stop());
+    process.on('SIGINT', () => manager.stop());
+
     await manager.start();
 }
 

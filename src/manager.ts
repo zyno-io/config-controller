@@ -1,15 +1,26 @@
 import * as k8s from '@kubernetes/client-node';
-import { parseEnvContent } from '@signal24/config';
+import { parseEnvContent } from '@zyno-io/config';
 
 import { K8sClient } from './k8s';
 import { createLogger } from './logger';
 
+const INITIAL_RETRY_DELAY = 1_000;
+const MAX_RETRY_DELAY = 30_000;
+
 export class Manager {
-    private logger = createLogger('K8sClient');
+    private logger = createLogger('Manager');
     private kubeWatch: k8s.Watch;
     private isReady = false;
     private isPendingSync = true;
     private cache: { [key: string]: { secret?: k8s.V1Secret; configMap?: k8s.V1ConfigMap } } = {};
+    private syncInterval?: ReturnType<typeof setInterval>;
+    private configMapAbortController?: AbortController;
+    private secretAbortController?: AbortController;
+    private stopped = false;
+    private configMapRetryDelay = INITIAL_RETRY_DELAY;
+    private secretRetryDelay = INITIAL_RETRY_DELAY;
+    private configMapResourceVersion?: string;
+    private secretResourceVersion?: string;
 
     constructor(private k8sClient: K8sClient) {
         this.kubeWatch = new k8s.Watch(this.k8sClient.kubeConfig);
@@ -24,18 +35,35 @@ export class Manager {
         this.isReady = true;
         this.syncSecrets();
 
-        setInterval(() => this.syncSecrets(), 30_000);
+        this.syncInterval = setInterval(() => this.syncSecrets(), 30_000);
+    }
+
+    stop() {
+        this.stopped = true;
+        this.configMapAbortController?.abort();
+        this.secretAbortController?.abort();
+        if (this.syncInterval) {
+            clearInterval(this.syncInterval);
+        }
     }
 
     async watchConfigMaps() {
         this.logger.info('Starting ConfigMap watch');
-        await this.kubeWatch.watch(
+        const queryParams: Record<string, string> = {
+            labelSelector: 'config.s24.dev/target-secret'
+        };
+        if (this.configMapResourceVersion) {
+            queryParams.resourceVersion = this.configMapResourceVersion;
+        }
+        this.configMapAbortController = await this.kubeWatch.watch(
             '/api/v1/configmaps',
-            {
-                labelSelector: 'config.s24.dev/target-secret'
-            },
-            (type, configMap: k8s.V1ConfigMap) => {
+            queryParams,
+            (type: string, configMap: k8s.V1ConfigMap) => {
+                this.configMapRetryDelay = INITIAL_RETRY_DELAY;
                 this.logger.info(`ConfigMap ${configMap.metadata?.name} ${type}`);
+                if (configMap.metadata?.resourceVersion) {
+                    this.configMapResourceVersion = configMap.metadata.resourceVersion;
+                }
                 const secretName = `${configMap.metadata?.namespace}/${configMap.metadata?.labels?.['config.s24.dev/target-secret']}`;
 
                 if (type === 'DELETED') {
@@ -47,22 +75,36 @@ export class Manager {
                 this.syncSecrets();
             },
             err => {
+                if (this.stopped) return;
                 this.logger.error({ err }, 'Failed to watch ConfigMaps');
-                setTimeout(() => this.watchConfigMaps(), 1000);
+                if (err?.code === 410) {
+                    this.configMapResourceVersion = undefined;
+                }
+                const delay = this.configMapRetryDelay;
+                this.configMapRetryDelay = Math.min(this.configMapRetryDelay * 2, MAX_RETRY_DELAY);
+                setTimeout(() => this.watchConfigMaps(), delay);
             }
         );
     }
 
     async watchSecrets() {
         this.logger.info('Starting Secret watch');
-        await this.kubeWatch.watch(
+        const queryParams: Record<string, string> = {
+            labelSelector: 'config.s24.dev/source-configmap'
+        };
+        if (this.secretResourceVersion) {
+            queryParams.resourceVersion = this.secretResourceVersion;
+        }
+        this.secretAbortController = await this.kubeWatch.watch(
             '/api/v1/secrets',
-            {
-                labelSelector: 'config.s24.dev/source-configmap'
-            },
-            (type, secret) => {
-                this.logger.info(`Secret ${secret.metadata.name} ${type}`);
-                const secretName = `${secret.metadata.namespace}/${secret.metadata.name}`;
+            queryParams,
+            (type: string, secret: k8s.V1Secret) => {
+                this.secretRetryDelay = INITIAL_RETRY_DELAY;
+                this.logger.info(`Secret ${secret.metadata?.name} ${type}`);
+                if (secret.metadata?.resourceVersion) {
+                    this.secretResourceVersion = secret.metadata.resourceVersion;
+                }
+                const secretName = `${secret.metadata?.namespace}/${secret.metadata?.name}`;
 
                 if (type === 'DELETED') {
                     this.cache[secretName] = { ...this.cache[secretName], secret: undefined };
@@ -73,8 +115,14 @@ export class Manager {
                 this.syncSecrets();
             },
             err => {
+                if (this.stopped) return;
                 this.logger.error({ err }, 'Failed to watch Secrets');
-                setTimeout(() => this.watchSecrets(), 1000);
+                if (err?.code === 410) {
+                    this.secretResourceVersion = undefined;
+                }
+                const delay = this.secretRetryDelay;
+                this.secretRetryDelay = Math.min(this.secretRetryDelay * 2, MAX_RETRY_DELAY);
+                setTimeout(() => this.watchSecrets(), delay);
             }
         );
     }
@@ -117,11 +165,14 @@ export class Manager {
                         name: secret!.metadata!.name!,
                         namespace: secret!.metadata!.namespace!
                     });
-                    delete this.cache[secretName];
-                    continue;
-                } catch (err) {
-                    this.logger.error({ err }, `Failed to delete secret ${secretName}`);
+                } catch (err: unknown) {
+                    if ((err as { code?: number })?.code !== 404) {
+                        this.logger.error({ err }, `Failed to delete secret ${secretName}`);
+                        continue;
+                    }
                 }
+                delete this.cache[secretName];
+                continue;
             }
 
             if (!secret) {

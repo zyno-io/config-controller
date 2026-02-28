@@ -1,0 +1,40 @@
+{
+    "plugins": ["typescript", "unicorn", "oxc", "promise", "import"],
+    "env": {
+        "builtin": true,
+        "es2025": true,
+        "commonjs": true,
+        "node": true,
+        "shared-node-browser": true
+    },
+    "ignorePatterns": ["dist/", ".yarn/", "src/openapi-client-generated/"],
+    "rules": {
+        "no-array-constructor": "error",
+        "no-case-declarations": "error",
+        "no-empty": "error",
+        "no-fallthrough": "error",
+        "no-prototype-builtins": "error",
+        "no-redeclare": "error",
+        "no-regex-spaces": "error",
+        "no-unused-expressions": "error",
+        "no-var": "error",
+        "prefer-rest-params": "error",
+        "prefer-spread": "error",
+        "typescript/ban-ts-comment": "error",
+        "typescript/no-empty-object-type": "error",
+        "typescript/no-explicit-any": "error",
+        "typescript/no-namespace": "error",
+        "typescript/no-require-imports": "error",
+        "typescript/no-unnecessary-type-constraint": "error",
+        "typescript/no-unsafe-function-type": "error",
+        "typescript/prefer-namespace-keyword": "error"
+    },
+    "overrides": [
+        {
+            "files": ["tests/**/*.spec.ts"],
+            "rules": {
+                "typescript/no-explicit-any": "off"
+            }
+        }
+    ]
+}

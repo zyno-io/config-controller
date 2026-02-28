@@ -6,7 +6,7 @@ module.exports = {
     testMatch: ['**/*.spec.ts'],
     collectCoverage: false,
     watchman: false,
-    reporters: ['default', 'buildkite-test-collector/jest/reporter'],
+    reporters: ['default'],
     coverageReporters: ['text', 'lcov', 'cobertura'],
     testLocationInResults: true
 };

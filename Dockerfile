@@ -1,7 +1,7 @@
 FROM node:24-alpine
 
 WORKDIR /app
-COPY package.json yarn.lock tsconfig.json ./
+COPY package.json yarn.lock .yarnrc.yml tsconfig.json ./
 COPY src ./src
 
 RUN apk add --no-cache tini && \

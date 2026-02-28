@@ -2,21 +2,21 @@
 
 Simple Kubernetes controller to create key/value Secrets from encrypted .env files stored in ConfigMaps.
 
-Based on the [@signal24/config](https://github.com/signal24/node-config) package.
+Based on the [@zyno-io/config](https://github.com/zyno-io/node-config) package.
 
 ## Installation
 
 ```
-helm repo add signal24 https://signal24.github.io/charts
+helm repo add zyno-io https://zyno-io.github.io/charts
 helm repo update
-helm install --namespace kube-system config-controller signal24/config-controller
+helm install --namespace kube-system config-controller zyno-io/config-controller
 ```
 
 ## Usage
 
 ### Source ConfigMap
 
-Load an [encrypted .env file](https://github.com/signal24/node-config?tab=readme-ov-file#setup) into a ConfigMap. Set the following labels:
+Load an [encrypted .env file](https://github.com/zyno-io/node-config?tab=readme-ov-file#setup) into a ConfigMap. Set the following labels:
 
 - `config.s24.dev/decryption-secret: dotenv-crypto-secrets`
 - `config.s24.dev/decryption-secret-key: CONFIG_SECRET_KEY` (optional, defaults to `CONFIG_DECRYPTION_KEY`)
