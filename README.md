@@ -18,10 +18,12 @@ helm install --namespace kube-system config-controller zyno-io/config-controller
 
 Load an [encrypted .env file](https://github.com/zyno-io/node-config?tab=readme-ov-file#setup) into a ConfigMap. Set the following labels:
 
-- `config.s24.dev/decryption-secret: dotenv-crypto-secrets`
-- `config.s24.dev/decryption-secret-key: CONFIG_SECRET_KEY` (optional, defaults to `CONFIG_DECRYPTION_KEY`)
-- `config.s24.dev/source-key: env_content` (optional, defaults to `.env`)
-- `config.s24.dev/target-secret: myapp-config`
+- `config.zyno.io/decryption-secret: dotenv-crypto-secrets`
+- `config.zyno.io/decryption-secret-key: CONFIG_SECRET_KEY` (optional, defaults to `CONFIG_DECRYPTION_KEY`)
+- `config.zyno.io/source-key: env_content` (optional, defaults to `.env`)
+- `config.zyno.io/target-secret: myapp-config`
+
+The legacy `config.s24.dev/*` labels are still accepted for backwards compatibility, but new manifests should use `config.zyno.io/*`.
 
 For example:
 
@@ -32,8 +34,8 @@ metadata:
     name: myapp-dotenv
     namespace: myapp
     labels:
-        config.s24.dev/decryption-secret: myapp-dotenv-crypto
-        config.s24.dev/target-secret: myapp-config
+        config.zyno.io/decryption-secret: myapp-dotenv-crypto
+        config.zyno.io/target-secret: myapp-config
 data:
     .env: |
         TWILIO_ACCOUNT_SID=AC123456
@@ -48,8 +50,8 @@ kind: ConfigMap
 metadata:
     name: myapp-dotenv
     labels:
-        config.s24.dev/decryption-secret: { { .Values.dotenv.decryptionSecret } }
-        config.s24.dev/target-secret: { { .Values.dotenv.targetSecret } }
+        config.zyno.io/decryption-secret: { { .Values.dotenv.decryptionSecret } }
+        config.zyno.io/target-secret: { { .Values.dotenv.targetSecret } }
 data:
     .env: |
         {{ .Values.dotenv.content | nindent 4 }}
@@ -82,8 +84,8 @@ metadata:
     name: myapp-config
     namespace: myapp
     labels:
-        config.s24.dev/source-configmap: myapp-dotenv
-        config.s24.dev/source-configmap-version: '123456'
+        config.zyno.io/source-configmap: myapp-dotenv
+        config.zyno.io/source-configmap-version: '123456'
 type: Opaque
 stringData:
     TWILIO_ACCOUNT_SID: AC123456

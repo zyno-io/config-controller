@@ -7,6 +7,6 @@ pre-commit:
       run: 'npx oxlint --fix --fix-suggestions --fix-dangerously {staged_files}'
       stage_fixed: true
     format:
-      glob: '*.{js,ts,jsx,tsx,json,vue,yaml,yml}'
-      run: npx prettier --write {staged_files}
+      glob: '*.{js,ts,jsx,tsx,json,vue,yaml,yml,md}'
+      run: npx oxfmt --no-error-on-unmatched-pattern --write {staged_files}
       stage_fixed: true

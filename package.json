@@ -2,40 +2,40 @@
     "name": "@zyno-io/config-controller",
     "version": "1.2.0",
     "description": "Simple Kubernetes controller to create key/value Secrets from encrypted .env files stored in ConfigMaps",
+    "license": "ISC",
+    "author": "Sean Ferguson <hello@sgnl24.com>",
     "main": "dist/index.js",
     "types": "dist/index.d.ts",
+    "publishConfig": {
+        "access": "public"
+    },
     "scripts": {
         "dev": "ts-node src/index.ts",
         "build": "rm -rf dist && tsc -p tsconfig.json",
-        "format": "npx oxlint --fix --fix-suggestions --fix-dangerously && prettier --write .",
+        "format": "npx oxlint --fix --fix-suggestions --fix-dangerously && oxfmt",
         "test": "jest",
         "watch": "tsc -w -p tsconfig.json"
     },
-    "author": "Sean Ferguson <hello@sgnl24.com>",
-    "license": "ISC",
     "dependencies": {
         "@kubernetes/client-node": "^1.4.0",
-        "@zyno-io/config": "1.10.0",
+        "@zyno-io/config": "1.11.0",
         "pino": "^10.3.1"
     },
     "devDependencies": {
         "@types/jest": "^30.0.0",
-        "@types/node": "^25.3.3",
-        "jest": "^30.2.0",
-        "lefthook": "^2.1.1",
-        "oxlint": "^1.50.0",
-        "prettier": "^3.8.1",
-        "ts-jest": "^29.4.6",
+        "@types/node": "^26.0.1",
+        "jest": "^30.4.2",
+        "lefthook": "^2.1.9",
+        "oxfmt": "^0.56.0",
+        "oxlint": "^1.71.0",
+        "ts-jest": "^29.4.11",
         "ts-node": "^10.9.2",
         "tslib": "^2.8.1",
-        "type-fest": "^5.4.4",
-        "typescript": "^5.9.3"
+        "type-fest": "^5.7.0",
+        "typescript": "^6.0.3"
     },
     "engines": {
         "node": ">=16.0.0"
     },
-    "publishConfig": {
-        "access": "public"
-    },
-    "packageManager": "yarn@4.12.0"
+    "packageManager": "yarn@4.17.0"
 }
