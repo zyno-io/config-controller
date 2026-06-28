@@ -2,6 +2,23 @@ import type * as k8s from '@kubernetes/client-node';
 
 import type { K8sClient } from './k8s';
 
+const CONFIG_LABELS = {
+    targetSecret: 'config.zyno.io/target-secret',
+    sourceKey: 'config.zyno.io/source-key',
+    decryptionSecret: 'config.zyno.io/decryption-secret',
+    decryptionSecretKey: 'config.zyno.io/decryption-secret-key',
+    sourceConfigMap: 'config.zyno.io/source-configmap',
+    sourceConfigMapVersion: 'config.zyno.io/source-configmap-version'
+};
+const LEGACY_CONFIG_LABELS = {
+    targetSecret: 'config.s24.dev/target-secret',
+    sourceKey: 'config.s24.dev/source-key',
+    decryptionSecret: 'config.s24.dev/decryption-secret',
+    decryptionSecretKey: 'config.s24.dev/decryption-secret-key',
+    sourceConfigMap: 'config.s24.dev/source-configmap',
+    sourceConfigMapVersion: 'config.s24.dev/source-configmap-version'
+};
+
 const mockParseEnvContent = jest.fn<Promise<Record<string, string>>, [string, string | undefined]>();
 const mockWatch = jest.fn();
 const mockLogger = {
@@ -81,16 +98,28 @@ describe('Manager', () => {
             await jest.advanceTimersByTimeAsync(5000);
             await startPromise;
 
-            expect(mockWatch).toHaveBeenCalledTimes(2);
+            expect(mockWatch).toHaveBeenCalledTimes(4);
             expect(mockWatch).toHaveBeenCalledWith(
                 '/api/v1/configmaps',
-                { labelSelector: 'config.s24.dev/target-secret' },
+                { labelSelector: CONFIG_LABELS.targetSecret },
+                expect.any(Function),
+                expect.any(Function)
+            );
+            expect(mockWatch).toHaveBeenCalledWith(
+                '/api/v1/configmaps',
+                { labelSelector: LEGACY_CONFIG_LABELS.targetSecret },
                 expect.any(Function),
                 expect.any(Function)
             );
             expect(mockWatch).toHaveBeenCalledWith(
                 '/api/v1/secrets',
-                { labelSelector: 'config.s24.dev/source-configmap' },
+                { labelSelector: CONFIG_LABELS.sourceConfigMap },
+                expect.any(Function),
+                expect.any(Function)
+            );
+            expect(mockWatch).toHaveBeenCalledWith(
+                '/api/v1/secrets',
+                { labelSelector: LEGACY_CONFIG_LABELS.sourceConfigMap },
                 expect.any(Function),
                 expect.any(Function)
             );
@@ -112,7 +141,7 @@ describe('Manager', () => {
                 namespace,
                 resourceVersion,
                 labels: {
-                    'config.s24.dev/target-secret': targetSecret
+                    [CONFIG_LABELS.targetSecret]: targetSecret
                 }
             },
             data
@@ -125,23 +154,25 @@ describe('Manager', () => {
                 name,
                 namespace,
                 labels: {
-                    'config.s24.dev/source-configmap': sourceConfigMap,
-                    'config.s24.dev/source-configmap-version': sourceVersion
+                    [CONFIG_LABELS.sourceConfigMap]: sourceConfigMap,
+                    [CONFIG_LABELS.sourceConfigMapVersion]: sourceVersion
                 }
             },
             type: 'Opaque',
             data: {}
         });
 
-        async function triggerConfigMapEvent(type: string, configMap: k8s.V1ConfigMap) {
-            const configMapCallback = mockWatch.mock.calls.find(call => call[0] === '/api/v1/configmaps')?.[2];
+        async function triggerConfigMapEvent(type: string, configMap: k8s.V1ConfigMap, labelSelector = CONFIG_LABELS.targetSecret) {
+            const configMapCallback = mockWatch.mock.calls.find(
+                call => call[0] === '/api/v1/configmaps' && call[1].labelSelector === labelSelector
+            )?.[2];
             if (configMapCallback) {
                 configMapCallback(type, configMap);
             }
         }
 
-        async function triggerSecretEvent(type: string, secret: k8s.V1Secret) {
-            const secretCallback = mockWatch.mock.calls.find(call => call[0] === '/api/v1/secrets')?.[2];
+        async function triggerSecretEvent(type: string, secret: k8s.V1Secret, labelSelector = CONFIG_LABELS.sourceConfigMap) {
+            const secretCallback = mockWatch.mock.calls.find(call => call[0] === '/api/v1/secrets' && call[1].labelSelector === labelSelector)?.[2];
             if (secretCallback) {
                 secretCallback(type, secret);
             }
@@ -176,8 +207,10 @@ describe('Manager', () => {
                         name: 'my-secret',
                         namespace: 'default',
                         labels: {
-                            'config.s24.dev/source-configmap': 'my-config',
-                            'config.s24.dev/source-configmap-version': '12345'
+                            [CONFIG_LABELS.sourceConfigMap]: 'my-config',
+                            [CONFIG_LABELS.sourceConfigMapVersion]: '12345',
+                            [LEGACY_CONFIG_LABELS.sourceConfigMap]: 'my-config',
+                            [LEGACY_CONFIG_LABELS.sourceConfigMapVersion]: '12345'
                         }
                     }),
                     data: {
@@ -267,7 +300,8 @@ describe('Manager', () => {
                     metadata: expect.objectContaining({
                         name: 'my-secret',
                         labels: expect.objectContaining({
-                            'config.s24.dev/source-configmap-version': '67890'
+                            [CONFIG_LABELS.sourceConfigMapVersion]: '67890',
+                            [LEGACY_CONFIG_LABELS.sourceConfigMapVersion]: '67890'
                         })
                     })
                 })
@@ -296,6 +330,46 @@ describe('Manager', () => {
             await triggerConfigMapEvent('MODIFIED', configMap);
 
             // Allow sync to complete
+            await jest.advanceTimersByTimeAsync(100);
+
+            expect(mockCoreV1Api.createNamespacedSecret).not.toHaveBeenCalled();
+            expect(mockCoreV1Api.replaceNamespacedSecret).not.toHaveBeenCalled();
+        });
+
+        it('should not update a secret when legacy source configmap version label matches', async () => {
+            mockParseEnvContent.mockResolvedValue({ KEY: 'value' });
+            mockCoreV1Api.createNamespacedSecret.mockResolvedValue({
+                metadata: { name: 'my-secret', namespace: 'default' },
+                data: { KEY: Buffer.from('value').toString('base64') }
+            });
+
+            await startManagerAndWait();
+
+            const configMap = createConfigMap('my-config', 'default', 'my-secret', '12345');
+            await triggerConfigMapEvent('ADDED', configMap);
+
+            const secret: k8s.V1Secret = {
+                apiVersion: 'v1',
+                kind: 'Secret',
+                metadata: {
+                    name: 'my-secret',
+                    namespace: 'default',
+                    labels: {
+                        [LEGACY_CONFIG_LABELS.sourceConfigMap]: 'my-config',
+                        [LEGACY_CONFIG_LABELS.sourceConfigMapVersion]: '12345'
+                    }
+                },
+                type: 'Opaque',
+                data: {}
+            };
+            await triggerSecretEvent('ADDED', secret, LEGACY_CONFIG_LABELS.sourceConfigMap);
+
+            await jest.advanceTimersByTimeAsync(100);
+
+            mockCoreV1Api.createNamespacedSecret.mockClear();
+            mockCoreV1Api.replaceNamespacedSecret.mockClear();
+
+            await triggerConfigMapEvent('MODIFIED', configMap);
             await jest.advanceTimersByTimeAsync(100);
 
             expect(mockCoreV1Api.createNamespacedSecret).not.toHaveBeenCalled();
@@ -353,8 +427,10 @@ describe('Manager', () => {
             await startPromise;
         }
 
-        async function triggerConfigMapEvent(type: string, configMap: k8s.V1ConfigMap) {
-            const configMapCallback = mockWatch.mock.calls.find(call => call[0] === '/api/v1/configmaps')?.[2];
+        async function triggerConfigMapEvent(type: string, configMap: k8s.V1ConfigMap, labelSelector = CONFIG_LABELS.targetSecret) {
+            const configMapCallback = mockWatch.mock.calls.find(
+                call => call[0] === '/api/v1/configmaps' && call[1].labelSelector === labelSelector
+            )?.[2];
             if (configMapCallback) {
                 configMapCallback(type, configMap);
             }
@@ -376,8 +452,8 @@ describe('Manager', () => {
                     namespace: 'default',
                     resourceVersion: '12345',
                     labels: {
-                        'config.s24.dev/target-secret': 'my-secret',
-                        'config.s24.dev/source-key': 'custom.env'
+                        [CONFIG_LABELS.targetSecret]: 'my-secret',
+                        [CONFIG_LABELS.sourceKey]: 'custom.env'
                     }
                 },
                 data: {
@@ -392,6 +468,52 @@ describe('Manager', () => {
             expect(mockParseEnvContent).toHaveBeenCalledWith('CUSTOM_KEY=custom_value', undefined);
         });
 
+        it('should use legacy source configmap labels', async () => {
+            mockParseEnvContent.mockResolvedValue({ KEY: 'value' });
+            mockCoreV1Api.createNamespacedSecret.mockResolvedValue({
+                metadata: { name: 'my-secret', namespace: 'default' }
+            });
+
+            await startManagerAndWait();
+
+            const configMap: k8s.V1ConfigMap = {
+                apiVersion: 'v1',
+                kind: 'ConfigMap',
+                metadata: {
+                    name: 'my-config',
+                    namespace: 'default',
+                    resourceVersion: '12345',
+                    labels: {
+                        [LEGACY_CONFIG_LABELS.targetSecret]: 'my-secret',
+                        [LEGACY_CONFIG_LABELS.sourceKey]: 'legacy.env'
+                    }
+                },
+                data: {
+                    'legacy.env': 'LEGACY_KEY=legacy_value'
+                }
+            };
+
+            await triggerConfigMapEvent('ADDED', configMap, LEGACY_CONFIG_LABELS.targetSecret);
+            await jest.advanceTimersByTimeAsync(0);
+            await Promise.resolve();
+
+            expect(mockParseEnvContent).toHaveBeenCalledWith('LEGACY_KEY=legacy_value', undefined);
+            expect(mockCoreV1Api.createNamespacedSecret).toHaveBeenCalledWith({
+                namespace: 'default',
+                body: expect.objectContaining({
+                    metadata: expect.objectContaining({
+                        name: 'my-secret',
+                        labels: expect.objectContaining({
+                            [CONFIG_LABELS.sourceConfigMap]: 'my-config',
+                            [CONFIG_LABELS.sourceConfigMapVersion]: '12345',
+                            [LEGACY_CONFIG_LABELS.sourceConfigMap]: 'my-config',
+                            [LEGACY_CONFIG_LABELS.sourceConfigMapVersion]: '12345'
+                        })
+                    })
+                })
+            });
+        });
+
         it('should throw error when source key is not found in configmap', async () => {
             await startManagerAndWait();
 
@@ -403,8 +525,8 @@ describe('Manager', () => {
                     namespace: 'default',
                     resourceVersion: '12345',
                     labels: {
-                        'config.s24.dev/target-secret': 'my-secret',
-                        'config.s24.dev/source-key': 'nonexistent.env'
+                        [CONFIG_LABELS.targetSecret]: 'my-secret',
+                        [CONFIG_LABELS.sourceKey]: 'nonexistent.env'
                     }
                 },
                 data: {
@@ -420,11 +542,11 @@ describe('Manager', () => {
             expect(mockCoreV1Api.createNamespacedSecret).not.toHaveBeenCalled();
         });
 
-        it('should retrieve decryption key from referenced secret', async () => {
+        it('should retrieve decryption secret from referenced secret', async () => {
             mockParseEnvContent.mockResolvedValue({ KEY: 'decrypted_value' });
             mockCoreV1Api.readNamespacedSecret.mockResolvedValue({
                 data: {
-                    CONFIG_DECRYPTION_KEY: Buffer.from('my-secret-key').toString('base64')
+                    CONFIG_DECRYPTION_SECRET: Buffer.from('my-secret-key').toString('base64')
                 }
             });
             mockCoreV1Api.createNamespacedSecret.mockResolvedValue({
@@ -441,8 +563,8 @@ describe('Manager', () => {
                     namespace: 'default',
                     resourceVersion: '12345',
                     labels: {
-                        'config.s24.dev/target-secret': 'my-secret',
-                        'config.s24.dev/decryption-secret': 'key-secret'
+                        [CONFIG_LABELS.targetSecret]: 'my-secret',
+                        [CONFIG_LABELS.decryptionSecret]: 'key-secret'
                     }
                 },
                 data: {
@@ -459,6 +581,81 @@ describe('Manager', () => {
                 namespace: 'default'
             });
             expect(mockParseEnvContent).toHaveBeenCalledWith('ENCRYPTED_KEY=encrypted_value', 'my-secret-key');
+        });
+
+        it('should fall back to the legacy decryption key name', async () => {
+            mockParseEnvContent.mockResolvedValue({ KEY: 'decrypted_value' });
+            mockCoreV1Api.readNamespacedSecret.mockResolvedValue({
+                data: {
+                    CONFIG_DECRYPTION_KEY: Buffer.from('legacy-secret-key').toString('base64')
+                }
+            });
+            mockCoreV1Api.createNamespacedSecret.mockResolvedValue({
+                metadata: { name: 'my-secret', namespace: 'default' }
+            });
+
+            await startManagerAndWait();
+
+            const configMap: k8s.V1ConfigMap = {
+                apiVersion: 'v1',
+                kind: 'ConfigMap',
+                metadata: {
+                    name: 'my-config',
+                    namespace: 'default',
+                    resourceVersion: '12345',
+                    labels: {
+                        [CONFIG_LABELS.targetSecret]: 'my-secret',
+                        [CONFIG_LABELS.decryptionSecret]: 'key-secret'
+                    }
+                },
+                data: {
+                    '.env': 'ENCRYPTED_KEY=encrypted_value'
+                }
+            };
+
+            await triggerConfigMapEvent('ADDED', configMap);
+            await jest.advanceTimersByTimeAsync(0);
+            await Promise.resolve();
+
+            expect(mockParseEnvContent).toHaveBeenCalledWith('ENCRYPTED_KEY=encrypted_value', 'legacy-secret-key');
+        });
+
+        it('should prefer the new decryption secret name when both default names are present', async () => {
+            mockParseEnvContent.mockResolvedValue({ KEY: 'decrypted_value' });
+            mockCoreV1Api.readNamespacedSecret.mockResolvedValue({
+                data: {
+                    CONFIG_DECRYPTION_SECRET: Buffer.from('preferred-secret-key').toString('base64'),
+                    CONFIG_DECRYPTION_KEY: Buffer.from('legacy-secret-key').toString('base64')
+                }
+            });
+            mockCoreV1Api.createNamespacedSecret.mockResolvedValue({
+                metadata: { name: 'my-secret', namespace: 'default' }
+            });
+
+            await startManagerAndWait();
+
+            const configMap: k8s.V1ConfigMap = {
+                apiVersion: 'v1',
+                kind: 'ConfigMap',
+                metadata: {
+                    name: 'my-config',
+                    namespace: 'default',
+                    resourceVersion: '12345',
+                    labels: {
+                        [CONFIG_LABELS.targetSecret]: 'my-secret',
+                        [CONFIG_LABELS.decryptionSecret]: 'key-secret'
+                    }
+                },
+                data: {
+                    '.env': 'ENCRYPTED_KEY=encrypted_value'
+                }
+            };
+
+            await triggerConfigMapEvent('ADDED', configMap);
+            await jest.advanceTimersByTimeAsync(0);
+            await Promise.resolve();
+
+            expect(mockParseEnvContent).toHaveBeenCalledWith('ENCRYPTED_KEY=encrypted_value', 'preferred-secret-key');
         });
 
         it('should use custom decryption key name from label', async () => {
@@ -482,9 +679,9 @@ describe('Manager', () => {
                     namespace: 'default',
                     resourceVersion: '12345',
                     labels: {
-                        'config.s24.dev/target-secret': 'my-secret',
-                        'config.s24.dev/decryption-secret': 'key-secret',
-                        'config.s24.dev/decryption-secret-key': 'CUSTOM_KEY_NAME'
+                        [CONFIG_LABELS.targetSecret]: 'my-secret',
+                        [CONFIG_LABELS.decryptionSecret]: 'key-secret',
+                        [CONFIG_LABELS.decryptionSecretKey]: 'CUSTOM_KEY_NAME'
                     }
                 },
                 data: {
@@ -521,7 +718,7 @@ describe('Manager', () => {
             await jest.advanceTimersByTimeAsync(1000);
 
             // Should have retried the watch
-            expect(mockWatch).toHaveBeenCalledTimes(3); // 2 initial + 1 retry
+            expect(mockWatch).toHaveBeenCalledTimes(5); // 4 initial + 1 retry
         });
 
         it('should retry secret watch on error', async () => {
@@ -540,7 +737,7 @@ describe('Manager', () => {
             await jest.advanceTimersByTimeAsync(1000);
 
             // Should have retried the watch
-            expect(mockWatch).toHaveBeenCalledTimes(3); // 2 initial + 1 retry
+            expect(mockWatch).toHaveBeenCalledTimes(5); // 4 initial + 1 retry
         });
     });
 
@@ -550,14 +747,13 @@ describe('Manager', () => {
             await jest.advanceTimersByTimeAsync(5000);
             await startPromise;
 
-            // Collect the abort controllers returned from both watch calls
-            const configMapAbort = await mockWatch.mock.results[0].value;
-            const secretAbort = await mockWatch.mock.results[1].value;
+            const abortControllers = await Promise.all(mockWatch.mock.results.map(result => result.value));
 
             manager.stop();
 
-            expect(configMapAbort.abort).toHaveBeenCalled();
-            expect(secretAbort.abort).toHaveBeenCalled();
+            for (const abortController of abortControllers) {
+                expect(abortController.abort).toHaveBeenCalled();
+            }
         });
 
         it('should not retry watches after stop is called', async () => {
@@ -577,8 +773,8 @@ describe('Manager', () => {
             // Advance past any potential retry delay
             await jest.advanceTimersByTimeAsync(60_000);
 
-            // Should still only have the 2 initial watch calls - no retries
-            expect(mockWatch).toHaveBeenCalledTimes(2);
+            // Should still only have the 4 initial watch calls - no retries
+            expect(mockWatch).toHaveBeenCalledTimes(4);
         });
     });
 
@@ -589,36 +785,36 @@ describe('Manager', () => {
             await startPromise;
 
             // Initial call count
-            expect(mockWatch).toHaveBeenCalledTimes(2);
+            expect(mockWatch).toHaveBeenCalledTimes(4);
 
             // First failure - should retry after 1s (initial delay)
             const errorCallback1 = mockWatch.mock.calls.find(call => call[0] === '/api/v1/configmaps')?.[3];
             errorCallback1(new Error('fail'));
 
             await jest.advanceTimersByTimeAsync(1000);
-            expect(mockWatch).toHaveBeenCalledTimes(3);
+            expect(mockWatch).toHaveBeenCalledTimes(5);
 
             // Second failure - should retry after 2s
-            const errorCallback2 = mockWatch.mock.calls[2][3];
+            const errorCallback2 = mockWatch.mock.calls[4][3];
             errorCallback2(new Error('fail'));
 
             // Not yet at 2s
             await jest.advanceTimersByTimeAsync(1000);
-            expect(mockWatch).toHaveBeenCalledTimes(3);
+            expect(mockWatch).toHaveBeenCalledTimes(5);
 
             // Now at 2s
             await jest.advanceTimersByTimeAsync(1000);
-            expect(mockWatch).toHaveBeenCalledTimes(4);
+            expect(mockWatch).toHaveBeenCalledTimes(6);
 
             // Third failure - should retry after 4s
-            const errorCallback3 = mockWatch.mock.calls[3][3];
+            const errorCallback3 = mockWatch.mock.calls[5][3];
             errorCallback3(new Error('fail'));
 
             await jest.advanceTimersByTimeAsync(3999);
-            expect(mockWatch).toHaveBeenCalledTimes(4);
+            expect(mockWatch).toHaveBeenCalledTimes(6);
 
             await jest.advanceTimersByTimeAsync(1);
-            expect(mockWatch).toHaveBeenCalledTimes(5);
+            expect(mockWatch).toHaveBeenCalledTimes(7);
         });
     });
 
@@ -635,7 +831,7 @@ describe('Manager', () => {
                     name: 'cm1',
                     namespace: 'default',
                     resourceVersion: '500',
-                    labels: { 'config.s24.dev/target-secret': 'sec1' }
+                    labels: { [CONFIG_LABELS.targetSecret]: 'sec1' }
                 },
                 data: {}
             });
@@ -647,10 +843,10 @@ describe('Manager', () => {
             await jest.advanceTimersByTimeAsync(1000);
 
             // The reconnect should include resourceVersion
-            const reconnectCall = mockWatch.mock.calls[2]; // 3rd call (index 2)
+            const reconnectCall = mockWatch.mock.calls[4]; // 5th call (index 4)
             expect(reconnectCall[0]).toBe('/api/v1/configmaps');
             expect(reconnectCall[1]).toEqual({
-                labelSelector: 'config.s24.dev/target-secret',
+                labelSelector: CONFIG_LABELS.targetSecret,
                 resourceVersion: '500'
             });
         });
@@ -667,7 +863,7 @@ describe('Manager', () => {
                     name: 'cm1',
                     namespace: 'default',
                     resourceVersion: '500',
-                    labels: { 'config.s24.dev/target-secret': 'sec1' }
+                    labels: { [CONFIG_LABELS.targetSecret]: 'sec1' }
                 },
                 data: {}
             });
@@ -679,10 +875,10 @@ describe('Manager', () => {
             await jest.advanceTimersByTimeAsync(1000);
 
             // The reconnect should NOT include resourceVersion (it was reset)
-            const reconnectCall = mockWatch.mock.calls[2];
+            const reconnectCall = mockWatch.mock.calls[4];
             expect(reconnectCall[0]).toBe('/api/v1/configmaps');
             expect(reconnectCall[1]).toEqual({
-                labelSelector: 'config.s24.dev/target-secret'
+                labelSelector: CONFIG_LABELS.targetSecret
             });
         });
     });
@@ -720,7 +916,7 @@ describe('Manager', () => {
                     name: 'test-config',
                     namespace: 'default',
                     resourceVersion: '1',
-                    labels: { 'config.s24.dev/target-secret': 'test-secret' }
+                    labels: { [CONFIG_LABELS.targetSecret]: 'test-secret' }
                 },
                 data: { '.env': 'KEY=value' }
             };

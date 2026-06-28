@@ -1,6 +1,6 @@
 {
     "name": "@zyno-io/config-controller",
-    "version": "1.2.0",
+    "version": "1.3.0",
     "description": "Simple Kubernetes controller to create key/value Secrets from encrypted .env files stored in ConfigMaps",
     "license": "ISC",
     "author": "Sean Ferguson <hello@sgnl24.com>",
@@ -18,7 +18,7 @@
     },
     "dependencies": {
         "@kubernetes/client-node": "^1.4.0",
-        "@zyno-io/config": "1.11.0",
+        "@zyno-io/config": "1.13.0",
         "pino": "^10.3.1"
     },
     "devDependencies": {

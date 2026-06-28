@@ -19,7 +19,7 @@ helm install --namespace kube-system config-controller zyno-io/config-controller
 Load an [encrypted .env file](https://github.com/zyno-io/node-config?tab=readme-ov-file#setup) into a ConfigMap. Set the following labels:
 
 - `config.zyno.io/decryption-secret: dotenv-crypto-secrets`
-- `config.zyno.io/decryption-secret-key: CONFIG_SECRET_KEY` (optional, defaults to `CONFIG_DECRYPTION_KEY`)
+- `config.zyno.io/decryption-secret-key: CONFIG_SECRET` (optional, defaults to `CONFIG_DECRYPTION_SECRET`)
 - `config.zyno.io/source-key: env_content` (optional, defaults to `.env`)
 - `config.zyno.io/target-secret: myapp-config`
 
@@ -57,9 +57,9 @@ data:
         {{ .Values.dotenv.content | nindent 4 }}
 ```
 
-### Decryption Key
+### Decryption Secret
 
-Create a secret with your decryption key:
+Create a secret with your decryption secret:
 
 ```yaml
 apiVersion: v1
@@ -69,9 +69,11 @@ metadata:
     namespace: myapp
 type: Opaque
 data:
-    CONFIG_DECRYPTION_KEY: >-
-        TFlJRXZn...long decryption key...xZRhXMcQ
+    CONFIG_DECRYPTION_SECRET: >-
+        TFlJRXZn...long decryption secret...xZRhXMcQ
 ```
+
+Legacy entries named `CONFIG_DECRYPTION_KEY` are still supported when `config.zyno.io/decryption-secret-key` is unset.
 
 ### 🪄 Auto-Generated Config Secret
 

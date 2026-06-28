@@ -1498,7 +1498,7 @@ __metadata:
     "@kubernetes/client-node": "npm:^1.4.0"
     "@types/jest": "npm:^30.0.0"
     "@types/node": "npm:^26.0.1"
-    "@zyno-io/config": "npm:1.11.0"
+    "@zyno-io/config": "npm:1.13.0"
     jest: "npm:^30.4.2"
     lefthook: "npm:^2.1.9"
     oxfmt: "npm:^0.56.0"
@@ -1512,15 +1512,15 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@zyno-io/config@npm:1.11.0":
-  version: 1.11.0
-  resolution: "@zyno-io/config@npm:1.11.0"
+"@zyno-io/config@npm:1.13.0":
+  version: 1.13.0
+  resolution: "@zyno-io/config@npm:1.13.0"
   dependencies:
-    commander: "npm:^14.0.3"
-    dotenv: "npm:^17.3.1"
+    commander: "npm:^15.0.0"
+    dotenv: "npm:^17.4.2"
   bin:
     config-cli: dist/cli.js
-  checksum: 10c0/271131d619303c5a2d7329cee11cfa6f235c9a808244b9fd9bb98d93d04b52b2fcce42b9176feb1ce57ae50ecd530beaf64e163408cdb75c177d4b2c6ab27192
+  checksum: 10c0/6cd92db34dbe9a37a6b88e60a4acac4a9da20b4945bfe0e47d0ec885296d12de5df3486338f794704af0546269b808c72463bec0c99aa6170351a475021f61e4
   languageName: node
   linkType: hard
 
@@ -2029,10 +2029,10 @@ __metadata:
   languageName: node
   linkType: hard
 
-"commander@npm:^14.0.3":
-  version: 14.0.3
-  resolution: "commander@npm:14.0.3"
-  checksum: 10c0/755652564bbf56ff2ff083313912b326450d3f8d8c85f4b71416539c9a05c3c67dbd206821ca72635bf6b160e2afdefcb458e86b317827d5cb333b69ce7f1a24
+"commander@npm:^15.0.0":
+  version: 15.0.0
+  resolution: "commander@npm:15.0.0"
+  checksum: 10c0/539229c171914ea1ccd45ee5f10d924289a12a684ea3a7a44147abe54003c35ed6de9ae4ad198d88c29fdf403dca0428451a388234e6dc01b6faa978fb207206
   languageName: node
   linkType: hard
 
@@ -2120,7 +2120,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"dotenv@npm:^17.3.1":
+"dotenv@npm:^17.4.2":
   version: 17.4.2
   resolution: "dotenv@npm:17.4.2"
   checksum: 10c0/164f8e77a646c8446867d5b588d26ea6005c8ea7c5eb41cf926f6113d23f2191355f6e0cfd95ea9bab98394a5b0a3f1e51a8399711b666fe55cc7b0bd745f942

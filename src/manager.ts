@@ -6,6 +6,33 @@ import { createLogger } from './logger';
 
 const INITIAL_RETRY_DELAY = 1_000;
 const MAX_RETRY_DELAY = 30_000;
+const DEFAULT_DECRYPTION_SECRET_KEY = 'CONFIG_DECRYPTION_SECRET';
+const LEGACY_DECRYPTION_SECRET_KEY = 'CONFIG_DECRYPTION_KEY';
+const CONFIG_LABEL_PREFIX = 'config.zyno.io';
+const LEGACY_CONFIG_LABEL_PREFIX = 'config.s24.dev';
+const CONFIG_LABELS = {
+    targetSecret: `${CONFIG_LABEL_PREFIX}/target-secret`,
+    sourceKey: `${CONFIG_LABEL_PREFIX}/source-key`,
+    decryptionSecret: `${CONFIG_LABEL_PREFIX}/decryption-secret`,
+    decryptionSecretKey: `${CONFIG_LABEL_PREFIX}/decryption-secret-key`,
+    sourceConfigMap: `${CONFIG_LABEL_PREFIX}/source-configmap`,
+    sourceConfigMapVersion: `${CONFIG_LABEL_PREFIX}/source-configmap-version`
+} as const;
+type ConfigLabelName = keyof typeof CONFIG_LABELS;
+const LEGACY_CONFIG_LABELS: Record<ConfigLabelName, string> = {
+    targetSecret: `${LEGACY_CONFIG_LABEL_PREFIX}/target-secret`,
+    sourceKey: `${LEGACY_CONFIG_LABEL_PREFIX}/source-key`,
+    decryptionSecret: `${LEGACY_CONFIG_LABEL_PREFIX}/decryption-secret`,
+    decryptionSecretKey: `${LEGACY_CONFIG_LABEL_PREFIX}/decryption-secret-key`,
+    sourceConfigMap: `${LEGACY_CONFIG_LABEL_PREFIX}/source-configmap`,
+    sourceConfigMapVersion: `${LEGACY_CONFIG_LABEL_PREFIX}/source-configmap-version`
+};
+const CONFIG_MAP_LABEL_SELECTORS = [CONFIG_LABELS.targetSecret, LEGACY_CONFIG_LABELS.targetSecret];
+const SECRET_LABEL_SELECTORS = [CONFIG_LABELS.sourceConfigMap, LEGACY_CONFIG_LABELS.sourceConfigMap];
+
+function getConfigLabel(metadata: k8s.V1ObjectMeta | undefined, labelName: ConfigLabelName): string | undefined {
+    return metadata?.labels?.[CONFIG_LABELS[labelName]] ?? metadata?.labels?.[LEGACY_CONFIG_LABELS[labelName]];
+}
 
 export class Manager {
     private logger = createLogger('Manager');
@@ -14,13 +41,13 @@ export class Manager {
     private isPendingSync = true;
     private cache: { [key: string]: { secret?: k8s.V1Secret; configMap?: k8s.V1ConfigMap } } = {};
     private syncInterval?: ReturnType<typeof setInterval>;
-    private configMapAbortController?: AbortController;
-    private secretAbortController?: AbortController;
+    private configMapAbortControllers = new Map<string, AbortController>();
+    private secretAbortControllers = new Map<string, AbortController>();
     private stopped = false;
-    private configMapRetryDelay = INITIAL_RETRY_DELAY;
-    private secretRetryDelay = INITIAL_RETRY_DELAY;
-    private configMapResourceVersion?: string;
-    private secretResourceVersion?: string;
+    private configMapRetryDelays = new Map<string, number>();
+    private secretRetryDelays = new Map<string, number>();
+    private configMapResourceVersions = new Map<string, string>();
+    private secretResourceVersions = new Map<string, string>();
 
     constructor(private k8sClient: K8sClient) {
         this.kubeWatch = new k8s.Watch(this.k8sClient.kubeConfig);
@@ -28,8 +55,12 @@ export class Manager {
     }
 
     async start() {
-        await this.watchConfigMaps();
-        await this.watchSecrets();
+        for (const labelSelector of CONFIG_MAP_LABEL_SELECTORS) {
+            await this.watchConfigMaps(labelSelector);
+        }
+        for (const labelSelector of SECRET_LABEL_SELECTORS) {
+            await this.watchSecrets(labelSelector);
+        }
 
         await new Promise(resolve => setTimeout(resolve, 5_000));
         this.isReady = true;
@@ -40,90 +71,107 @@ export class Manager {
 
     stop() {
         this.stopped = true;
-        this.configMapAbortController?.abort();
-        this.secretAbortController?.abort();
+        for (const abortController of this.configMapAbortControllers.values()) {
+            abortController.abort();
+        }
+        for (const abortController of this.secretAbortControllers.values()) {
+            abortController.abort();
+        }
         if (this.syncInterval) {
             clearInterval(this.syncInterval);
         }
     }
 
-    async watchConfigMaps() {
-        this.logger.info('Starting ConfigMap watch');
+    async watchConfigMaps(labelSelector: string = CONFIG_LABELS.targetSecret) {
+        this.logger.info(`Starting ConfigMap watch for ${labelSelector}`);
         const queryParams: Record<string, string> = {
-            labelSelector: 'config.s24.dev/target-secret'
+            labelSelector
         };
-        if (this.configMapResourceVersion) {
-            queryParams.resourceVersion = this.configMapResourceVersion;
+        const resourceVersion = this.configMapResourceVersions.get(labelSelector);
+        if (resourceVersion) {
+            queryParams.resourceVersion = resourceVersion;
         }
-        this.configMapAbortController = await this.kubeWatch.watch(
-            '/api/v1/configmaps',
-            queryParams,
-            (type: string, configMap: k8s.V1ConfigMap) => {
-                this.configMapRetryDelay = INITIAL_RETRY_DELAY;
-                this.logger.info(`ConfigMap ${configMap.metadata?.name} ${type}`);
-                if (configMap.metadata?.resourceVersion) {
-                    this.configMapResourceVersion = configMap.metadata.resourceVersion;
-                }
-                const secretName = `${configMap.metadata?.namespace}/${configMap.metadata?.labels?.['config.s24.dev/target-secret']}`;
+        this.configMapAbortControllers.set(
+            labelSelector,
+            await this.kubeWatch.watch(
+                '/api/v1/configmaps',
+                queryParams,
+                (type: string, configMap: k8s.V1ConfigMap) => {
+                    this.configMapRetryDelays.set(labelSelector, INITIAL_RETRY_DELAY);
+                    this.logger.info(`ConfigMap ${configMap.metadata?.name} ${type}`);
+                    if (configMap.metadata?.resourceVersion) {
+                        this.configMapResourceVersions.set(labelSelector, configMap.metadata.resourceVersion);
+                    }
+                    const targetSecret = getConfigLabel(configMap.metadata, 'targetSecret');
+                    if (!targetSecret) {
+                        this.logger.info(`ConfigMap ${configMap.metadata?.name} does not declare a target secret. Skipping.`);
+                        return;
+                    }
+                    const secretName = `${configMap.metadata?.namespace}/${targetSecret}`;
 
-                if (type === 'DELETED') {
-                    this.cache[secretName] = { ...this.cache[secretName], configMap: undefined };
-                } else {
-                    this.cache[secretName] = { ...this.cache[secretName], configMap };
-                }
+                    if (type === 'DELETED') {
+                        this.cache[secretName] = { ...this.cache[secretName], configMap: undefined };
+                    } else {
+                        this.cache[secretName] = { ...this.cache[secretName], configMap };
+                    }
 
-                this.syncSecrets();
-            },
-            err => {
-                if (this.stopped) return;
-                this.logger.error({ err }, 'Failed to watch ConfigMaps');
-                if (err?.code === 410) {
-                    this.configMapResourceVersion = undefined;
+                    this.syncSecrets();
+                },
+                err => {
+                    if (this.stopped) return;
+                    this.logger.error({ err }, 'Failed to watch ConfigMaps');
+                    if (err?.code === 410) {
+                        this.configMapResourceVersions.delete(labelSelector);
+                    }
+                    const delay = this.configMapRetryDelays.get(labelSelector) ?? INITIAL_RETRY_DELAY;
+                    this.configMapRetryDelays.set(labelSelector, Math.min(delay * 2, MAX_RETRY_DELAY));
+                    setTimeout(() => this.watchConfigMaps(labelSelector), delay);
                 }
-                const delay = this.configMapRetryDelay;
-                this.configMapRetryDelay = Math.min(this.configMapRetryDelay * 2, MAX_RETRY_DELAY);
-                setTimeout(() => this.watchConfigMaps(), delay);
-            }
+            )
         );
     }
 
-    async watchSecrets() {
-        this.logger.info('Starting Secret watch');
+    async watchSecrets(labelSelector: string = CONFIG_LABELS.sourceConfigMap) {
+        this.logger.info(`Starting Secret watch for ${labelSelector}`);
         const queryParams: Record<string, string> = {
-            labelSelector: 'config.s24.dev/source-configmap'
+            labelSelector
         };
-        if (this.secretResourceVersion) {
-            queryParams.resourceVersion = this.secretResourceVersion;
+        const resourceVersion = this.secretResourceVersions.get(labelSelector);
+        if (resourceVersion) {
+            queryParams.resourceVersion = resourceVersion;
         }
-        this.secretAbortController = await this.kubeWatch.watch(
-            '/api/v1/secrets',
-            queryParams,
-            (type: string, secret: k8s.V1Secret) => {
-                this.secretRetryDelay = INITIAL_RETRY_DELAY;
-                this.logger.info(`Secret ${secret.metadata?.name} ${type}`);
-                if (secret.metadata?.resourceVersion) {
-                    this.secretResourceVersion = secret.metadata.resourceVersion;
-                }
-                const secretName = `${secret.metadata?.namespace}/${secret.metadata?.name}`;
+        this.secretAbortControllers.set(
+            labelSelector,
+            await this.kubeWatch.watch(
+                '/api/v1/secrets',
+                queryParams,
+                (type: string, secret: k8s.V1Secret) => {
+                    this.secretRetryDelays.set(labelSelector, INITIAL_RETRY_DELAY);
+                    this.logger.info(`Secret ${secret.metadata?.name} ${type}`);
+                    if (secret.metadata?.resourceVersion) {
+                        this.secretResourceVersions.set(labelSelector, secret.metadata.resourceVersion);
+                    }
+                    const secretName = `${secret.metadata?.namespace}/${secret.metadata?.name}`;
 
-                if (type === 'DELETED') {
-                    this.cache[secretName] = { ...this.cache[secretName], secret: undefined };
-                } else {
-                    this.cache[secretName] = { ...this.cache[secretName], secret };
-                }
+                    if (type === 'DELETED') {
+                        this.cache[secretName] = { ...this.cache[secretName], secret: undefined };
+                    } else {
+                        this.cache[secretName] = { ...this.cache[secretName], secret };
+                    }
 
-                this.syncSecrets();
-            },
-            err => {
-                if (this.stopped) return;
-                this.logger.error({ err }, 'Failed to watch Secrets');
-                if (err?.code === 410) {
-                    this.secretResourceVersion = undefined;
+                    this.syncSecrets();
+                },
+                err => {
+                    if (this.stopped) return;
+                    this.logger.error({ err }, 'Failed to watch Secrets');
+                    if (err?.code === 410) {
+                        this.secretResourceVersions.delete(labelSelector);
+                    }
+                    const delay = this.secretRetryDelays.get(labelSelector) ?? INITIAL_RETRY_DELAY;
+                    this.secretRetryDelays.set(labelSelector, Math.min(delay * 2, MAX_RETRY_DELAY));
+                    setTimeout(() => this.watchSecrets(labelSelector), delay);
                 }
-                const delay = this.secretRetryDelay;
-                this.secretRetryDelay = Math.min(this.secretRetryDelay * 2, MAX_RETRY_DELAY);
-                setTimeout(() => this.watchSecrets(), delay);
-            }
+            )
         );
     }
 
@@ -182,7 +230,7 @@ export class Manager {
                 } catch (err) {
                     this.logger.error({ err }, `Failed to create secret ${secretName}`);
                 }
-            } else if (secret.metadata!.labels?.['config.s24.dev/source-configmap-version'] !== configMap!.metadata!.resourceVersion) {
+            } else if (getConfigLabel(secret.metadata, 'sourceConfigMapVersion') !== configMap!.metadata!.resourceVersion) {
                 this.logger.info(`ConfigMap for ${secretName} updated. Updating secret.`);
                 try {
                     this.cache[secretName].secret = await this.createSecretForConfigMap(configMap!, secret);
@@ -194,19 +242,19 @@ export class Manager {
     }
 
     private async createSecretForConfigMap(configMap: k8s.V1ConfigMap, existingSecret?: k8s.V1Secret): Promise<k8s.V1Secret> {
-        const sourceKey = configMap.metadata?.labels?.['config.s24.dev/source-key'] ?? '.env';
+        const sourceKey = getConfigLabel(configMap.metadata, 'sourceKey') ?? '.env';
         const sourceData = configMap.data?.[sourceKey];
         if (sourceData === undefined) {
             throw new Error(`Key ${sourceKey} not found in ConfigMap ${configMap.metadata?.name}`);
         }
 
-        const keySecretName = configMap.metadata?.labels?.['config.s24.dev/decryption-secret'];
-        const keySecretKey = configMap.metadata?.labels?.['config.s24.dev/decryption-secret-key'] ?? 'CONFIG_DECRYPTION_KEY';
+        const keySecretName = getConfigLabel(configMap.metadata, 'decryptionSecret');
+        const keySecretKey = getConfigLabel(configMap.metadata, 'decryptionSecretKey');
         const decryptionSecret = keySecretName
             ? await this.getDecryptionSecret(configMap.metadata!.namespace!, keySecretName, keySecretKey)
             : undefined;
 
-        const targetSecret = configMap.metadata!.labels!['config.s24.dev/target-secret'];
+        const targetSecret = getConfigLabel(configMap.metadata, 'targetSecret')!;
 
         const secretData = await this.extractConfigFromEncryptedEnv(sourceData, decryptionSecret);
         const secret = await this.createSecretWithConfigMapData(configMap, targetSecret, secretData, existingSecret);
@@ -214,7 +262,7 @@ export class Manager {
         return secret;
     }
 
-    private async getDecryptionSecret(sourceNs: string, keySecretName: string, keySecretKey: string): Promise<string> {
+    private async getDecryptionSecret(sourceNs: string, keySecretName: string, keySecretKey?: string): Promise<string> {
         // TODO: There's a security risk involved here. Figure out how to make this more secure. Maybe require an annotation on the source secret?
         // const [secretNs, secretName] = keySecretName.includes('/') ? keySecretName.split('/') : [sourceNs, keySecretName];
         const [secretNs, secretName] = [sourceNs, keySecretName];
@@ -222,10 +270,15 @@ export class Manager {
             name: secretName,
             namespace: secretNs
         });
-        if (secret.data?.[keySecretKey] === undefined) {
-            throw new Error(`Key ${keySecretKey} not found in secret ${keySecretName}`);
+        const selectedKey =
+            keySecretKey ??
+            (secret.data?.[DEFAULT_DECRYPTION_SECRET_KEY] !== undefined ? DEFAULT_DECRYPTION_SECRET_KEY : LEGACY_DECRYPTION_SECRET_KEY);
+        const encodedSecret = secret.data?.[selectedKey];
+        if (encodedSecret === undefined) {
+            const expectedKey = keySecretKey ?? `${DEFAULT_DECRYPTION_SECRET_KEY} or ${LEGACY_DECRYPTION_SECRET_KEY}`;
+            throw new Error(`Key ${expectedKey} not found in secret ${keySecretName}`);
         }
-        return Buffer.from(secret.data[keySecretKey], 'base64').toString('utf-8');
+        return Buffer.from(encodedSecret, 'base64').toString('utf-8');
     }
 
     private async extractConfigFromEncryptedEnv(data: string, decryptionSecret?: string): Promise<{ [key: string]: string }> {
@@ -245,8 +298,10 @@ export class Manager {
                 name,
                 namespace: configMap.metadata!.namespace!,
                 labels: {
-                    'config.s24.dev/source-configmap': configMap.metadata!.name!,
-                    'config.s24.dev/source-configmap-version': configMap.metadata!.resourceVersion!
+                    [CONFIG_LABELS.sourceConfigMap]: configMap.metadata!.name!,
+                    [CONFIG_LABELS.sourceConfigMapVersion]: configMap.metadata!.resourceVersion!,
+                    [LEGACY_CONFIG_LABELS.sourceConfigMap]: configMap.metadata!.name!,
+                    [LEGACY_CONFIG_LABELS.sourceConfigMapVersion]: configMap.metadata!.resourceVersion!
                 }
             },
             type: 'Opaque',
