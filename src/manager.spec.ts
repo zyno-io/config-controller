@@ -190,6 +190,21 @@ describe('Manager', () => {
             await startPromise;
         }
 
+        /** Starts with an already-reconciled pair, listed under the modern labels only. */
+        async function startManagerWithReconciledPair(configMap: k8s.V1ConfigMap, secret: k8s.V1Secret) {
+            mockCoreV1Api.listConfigMapForAllNamespaces.mockImplementation(async ({ labelSelector }) => ({
+                items: labelSelector === CONFIG_LABELS.targetSecret ? [configMap] : [],
+                metadata: { resourceVersion: '100' }
+            }));
+            mockCoreV1Api.listSecretForAllNamespaces.mockImplementation(async ({ labelSelector }) => ({
+                items: labelSelector === CONFIG_LABELS.sourceConfigMap ? [secret] : [],
+                metadata: { resourceVersion: '100' }
+            }));
+            await startManagerAndWait();
+            await jest.advanceTimersByTimeAsync(0);
+            await Promise.resolve();
+        }
+
         it('should create a secret when a new configmap is added', async () => {
             mockParseEnvContent.mockResolvedValue({ KEY: 'value', OTHER: 'data' });
             mockCoreV1Api.createNamespacedSecret.mockResolvedValue({
@@ -423,6 +438,110 @@ describe('Manager', () => {
             await Promise.resolve();
 
             expect(mockCoreV1Api.deleteNamespacedSecret).not.toHaveBeenCalled();
+        });
+
+        describe('configmap replaced while its secret deletion is in flight', () => {
+            // Helm's `before-hook-creation` policy deletes and recreates a hook ConfigMap
+            // back-to-back, so the ADDED event can arrive while the secret delete triggered by
+            // the DELETED event is still awaiting the API server. The stream then reports the
+            // old Secret's deletion at some point after that — possibly after the controller
+            // has already created its successor.
+            let resolveDelete!: () => void;
+            let oldSecret: k8s.V1Secret;
+            let newConfigMap: k8s.V1ConfigMap;
+
+            async function settle() {
+                await jest.advanceTimersByTimeAsync(0);
+                await Promise.resolve();
+            }
+
+            beforeEach(async () => {
+                mockCoreV1Api.deleteNamespacedSecret.mockReturnValue(new Promise<void>(resolve => (resolveDelete = () => resolve())));
+                mockParseEnvContent.mockResolvedValue({ KEY: 'value' });
+                mockCoreV1Api.createNamespacedSecret.mockImplementation(async ({ body }) => ({
+                    ...body,
+                    metadata: { ...body.metadata, uid: 'uid-new' }
+                }));
+
+                // Start from a reconciled pair seeded by the initial LIST, so the ConfigMap
+                // DELETED below is what puts the secret delete in flight.
+                oldSecret = createSecret('my-secret', 'default', 'my-config', '1');
+                oldSecret.metadata!.uid = 'uid-old';
+                const oldConfigMap = createConfigMap('my-config', 'default', 'my-secret', '1');
+                await startManagerWithReconciledPair(oldConfigMap, oldSecret);
+                expect(mockCoreV1Api.createNamespacedSecret).not.toHaveBeenCalled();
+                expect(mockCoreV1Api.deleteNamespacedSecret).not.toHaveBeenCalled();
+
+                await triggerConfigMapEvent('DELETED', oldConfigMap);
+                await settle();
+                expect(mockCoreV1Api.deleteNamespacedSecret).toHaveBeenCalledTimes(1);
+
+                // The replacement lands before the delete returns.
+                newConfigMap = createConfigMap('my-config', 'default', 'my-secret', '2');
+                await triggerConfigMapEvent('ADDED', newConfigMap);
+            });
+
+            async function expectSingleRecreateAndSteadyState() {
+                expect(mockCoreV1Api.createNamespacedSecret).toHaveBeenCalledTimes(1);
+                expect(mockCoreV1Api.createNamespacedSecret).toHaveBeenCalledWith({
+                    namespace: 'default',
+                    body: expect.objectContaining({
+                        metadata: expect.objectContaining({
+                            name: 'my-secret',
+                            labels: expect.objectContaining({ [CONFIG_LABELS.sourceConfigMapVersion]: '2' })
+                        })
+                    })
+                });
+
+                // The entry stays reconciled: a later sync neither deletes nor recreates anything.
+                mockCoreV1Api.deleteNamespacedSecret.mockClear();
+                mockCoreV1Api.createNamespacedSecret.mockClear();
+                manager.syncSecrets();
+                await settle();
+                expect(mockCoreV1Api.deleteNamespacedSecret).not.toHaveBeenCalled();
+                expect(mockCoreV1Api.createNamespacedSecret).not.toHaveBeenCalled();
+                expect(mockLogger.error).not.toHaveBeenCalled();
+            }
+
+            it('should recreate the secret when the stream reports the old secret deleted before the delete returns', async () => {
+                await triggerSecretEvent('DELETED', oldSecret);
+                resolveDelete();
+                await settle();
+
+                await expectSingleRecreateAndSteadyState();
+            });
+
+            it('should recreate the secret when the stream reports the old secret deleted after the delete returns', async () => {
+                resolveDelete();
+                await settle();
+                expect(mockCoreV1Api.createNamespacedSecret).toHaveBeenCalledTimes(1);
+
+                // A late DELETED for the old object must not evict the successor.
+                await triggerSecretEvent('DELETED', oldSecret);
+                await settle();
+
+                await expectSingleRecreateAndSteadyState();
+            });
+        });
+
+        it('should recreate a secret when the stream reports the object it holds deleted', async () => {
+            // The superseded-object guard must not swallow a genuine external deletion.
+            mockParseEnvContent.mockResolvedValue({ KEY: 'value' });
+            mockCoreV1Api.createNamespacedSecret.mockImplementation(async ({ body }) => body);
+
+            const secret = createSecret('my-secret', 'default', 'my-config', '1');
+            secret.metadata!.uid = 'uid-1';
+            const configMap = createConfigMap('my-config', 'default', 'my-secret', '1');
+            await startManagerWithReconciledPair(configMap, secret);
+            expect(mockCoreV1Api.createNamespacedSecret).not.toHaveBeenCalled();
+
+            await triggerSecretEvent('DELETED', secret);
+            await jest.advanceTimersByTimeAsync(0);
+            await Promise.resolve();
+
+            expect(mockCoreV1Api.createNamespacedSecret).toHaveBeenCalledTimes(1);
+            expect(mockCoreV1Api.deleteNamespacedSecret).not.toHaveBeenCalled();
+            expect(mockLogger.error).not.toHaveBeenCalled();
         });
     });
 

@@ -405,7 +405,21 @@ export class Manager {
                 if (!secretName) return;
 
                 if (type === WATCH_EVENT_DELETED) {
-                    if (!this.removeSelectorClaim(this.secretKeysBySelector, labelSelector, secretName)) {
+                    // This stream has said the object is gone, so its claim goes regardless of
+                    // what we do with the cache below; a retained claim would later block a
+                    // genuine deletion reported on the other stream.
+                    const stillClaimed = this.removeSelectorClaim(this.secretKeysBySelector, labelSelector, secretName);
+                    // The controller's own delete-then-create of a Secret (a ConfigMap
+                    // replaced while its deletion was in flight) can outrun the stream: by
+                    // the time DELETED for the old object arrives, the cache already holds
+                    // the successor. Evicting it would trigger a second create that 409s.
+                    const cachedUid = this.cache[secretName]?.secret?.metadata?.uid;
+                    const deletedUid = secret.metadata?.uid;
+                    if (cachedUid && deletedUid && cachedUid !== deletedUid) {
+                        this.logger.info(`Secret ${secret.metadata?.name} DELETED is for a superseded object. Ignoring.`);
+                        return;
+                    }
+                    if (!stillClaimed) {
                         this.cache[secretName] = { ...this.cache[secretName], secret: undefined };
                     }
                 } else {
@@ -486,25 +500,53 @@ export class Manager {
                         continue;
                     }
                 }
-                delete this.cache[secretName];
+                // The watch handlers keep running while the delete is in flight, and a ConfigMap
+                // may have (re)appeared in the meantime: Helm's `before-hook-creation` policy
+                // deletes and recreates a hook ConfigMap back-to-back, so its ADDED event can
+                // land here. Dropping the whole entry would forget that ConfigMap until the next
+                // re-list, leaving its Secret missing while the controller reports itself in sync.
+                // Clear only the half we just deleted; the pending sync then recreates the Secret.
+                this.clearCachedSecret(secretName);
                 continue;
             }
 
             if (!secret) {
                 this.logger.info(`Secret for ${secretName} does not exist. Creating secret.`);
                 try {
-                    this.cache[secretName].secret = await this.createSecretForConfigMap(configMap!);
+                    this.setCachedSecret(secretName, secret, await this.createSecretForConfigMap(configMap!));
                 } catch (err) {
                     this.logger.error({ err }, `Failed to create secret ${secretName}`);
                 }
             } else if (getConfigLabel(secret.metadata, 'sourceConfigMapVersion') !== configMap!.metadata!.resourceVersion) {
                 this.logger.info(`ConfigMap for ${secretName} updated. Updating secret.`);
                 try {
-                    this.cache[secretName].secret = await this.createSecretForConfigMap(configMap!, secret);
+                    this.setCachedSecret(secretName, secret, await this.createSecretForConfigMap(configMap!, secret));
                 } catch (err) {
                     this.logger.error({ err }, `Failed to update secret ${secretName}`);
                 }
             }
+        }
+    }
+
+    /**
+     * Records the Secret a create/replace returned, on the entry the cache holds *now*. The
+     * watch handlers replace entry objects wholesale (`{ ...this.cache[key], ... }`), so the
+     * entry captured before the `await` may no longer be the live one, and writing to it
+     * would be a lost update. If the Secret watch already delivered a newer view while the
+     * call was in flight, that view wins: it is at least as fresh as the API response.
+     */
+    private setCachedSecret(secretName: string, previous: k8s.V1Secret | undefined, secret: k8s.V1Secret) {
+        const entry = this.cache[secretName];
+        if (entry && entry.secret === previous) entry.secret = secret;
+    }
+
+    /** Forgets a deleted Secret, keeping the entry when a ConfigMap still needs reconciling. */
+    private clearCachedSecret(secretName: string) {
+        const entry = this.cache[secretName];
+        if (entry?.configMap) {
+            entry.secret = undefined;
+        } else {
+            delete this.cache[secretName];
         }
     }
 
